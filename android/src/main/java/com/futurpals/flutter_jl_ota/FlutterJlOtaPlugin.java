@@ -10,6 +10,7 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 
+import com.futurpals.flutter_jl_ota.tool.AppUtil;
 import com.futurpals.flutter_jl_ota.tool.ConfigHelper;
 import com.jieli.jl_bt_ota.constant.JL_Constant;
 import com.jieli.jl_bt_ota.interfaces.IActionCallback;
@@ -37,10 +38,16 @@ import io.flutter.plugin.common.MethodChannel.Result;
  */
 public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, ActivityAware {
     private static final String TAG = "FlutterJlOtaPlugin";
+    private static final long SCAN_TIMEOUT_MS = 20_000L;
+    // Allow the scan (20s) and BLE connection setup (40s) to finish.
+    private static final long PREPARATION_TIMEOUT_MS = 60_000L;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private MethodChannel channel;
     private Context context;
     private OtaManager otaManager;
     private boolean otaStartRequested = false;
+    private boolean waitingForConnection = false;
+    private Runnable preparationTimeout;
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
@@ -68,11 +75,9 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-        if (otaManager != null) {
-            otaManager.release();
-            otaManager = null;
-        }
+        releaseOtaManager();
         channel.setMethodCallHandler(null);
+        channel = null;
     }
 
     @SuppressLint("MissingPermission")
@@ -98,9 +103,14 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
             case "startScan":
                 if (!ensureBluetoothAvailable(result)) return;
+                if (!ensureScanPermission(result)) return;
                 initOtaManagerIfNeeded("", ""); // No specific UUID or name is required for scanning.
-                otaManager.startLeScan(20 * 1000L); // 20-second timeout.
-                result.success(true);
+                if (otaManager.startLeScan(SCAN_TIMEOUT_MS)) {
+                    result.success(true);
+                } else {
+                    releaseOtaManager();
+                    result.error("BLE_SCAN_FAILED", "BLE scanning could not be started", null);
+                }
                 break;
 
             case "stopScan":
@@ -153,24 +163,40 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
             case "startOtaUpdate":
                 if (!ensureBluetoothAvailable(result)) return;
+                if (!ensureScanPermission(result)) return;
+                if (waitingForConnection || otaStartRequested
+                        || (otaManager != null && otaManager.isOTA())) {
+                    result.error("OTA_IN_PROGRESS", "An OTA request is already in progress", null);
+                    return;
+                }
                 String otaUuid = call.argument("uuid");
                 String filePath = call.argument("filePath");
                 String otaDeviceName = call.argument("deviceName");
                 if (otaUuid != null && !otaUuid.isEmpty() && filePath != null && !filePath.isEmpty()) {
-                    initOtaManagerIfNeeded(otaUuid, otaDeviceName != null ? otaDeviceName : "");
-                    startOtaUpdate(otaUuid, filePath, result);
+                    try {
+                        initOtaManagerIfNeeded(otaUuid, otaDeviceName != null ? otaDeviceName : "");
+                        startOtaUpdate(otaUuid, filePath, result);
+                    } catch (RuntimeException error) {
+                        releaseOtaManager();
+                        Log.e(TAG, "Failed to prepare OTA", error);
+                        result.error("OTA_START_FAILED", error.getMessage(), null);
+                    }
                 } else {
                     result.error("INVALID_PARAMS", "UUID or filePath is invalid or empty", null);
                 }
                 break;
 
             case "cancelOtaUpdate":
-                if (!ensureBluetoothAvailable(result)) return;
                 if (otaManager == null) {
-                    result.error("NOT_INITIALIZED", "OTA manager not initialized", null);
+                    result.success(false);
                     return;
                 }
-                otaManager.cancelOTA();
+                if (waitingForConnection || !otaManager.isOTA()) {
+                    releaseOtaManager();
+                    invokeProgress(0, "CANCELED");
+                } else {
+                    otaManager.cancelOTA();
+                }
                 result.success(true); // Dual-bank OTA supports cancellation.
                 break;
 
@@ -181,9 +207,22 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
     }
 
     private boolean ensureBluetoothAvailable(@NonNull Result result) {
+        if (!AppUtil.checkHasConnectPermission(context)) {
+            result.error("MISSING_PERMISSION", "Bluetooth connect permission is required", null);
+            return false;
+        }
         BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
             result.error("BLUETOOTH_NOT_AVAILABLE", "Bluetooth is not available or not enabled", null);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean ensureScanPermission(@NonNull Result result) {
+        if (!AppUtil.checkHasScanPermission(context)) {
+            result.error("MISSING_PERMISSION",
+                    "Bluetooth scan or legacy Android location permission is required", null);
             return false;
         }
         return true;
@@ -196,7 +235,7 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
             configureOtaManager();
             Log.d(TAG, "OtaManager initialized with mac: " + mac);
         } else if (!mac.isEmpty() && !otaManager.mac.equals(mac)) {
-            otaManager.release();
+            releaseOtaManager();
             otaManager = new OtaManager(context, mac, deviceName);
             configureOtaManager();
             Log.d(TAG, "OtaManager reinitialized with new mac: " + mac);
@@ -219,52 +258,100 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
     // Starts the OTA update.
     private void startOtaUpdate(String uuid, String filePath, Result result) {
+        final OtaManager manager = otaManager;
         otaStartRequested = false;
-        otaManager.setOtaStatusCallback(new OtaStatusCallback() {
+        waitingForConnection = true;
+        preparationTimeout = () -> failPreparation(manager, "OTA connection preparation timed out");
+        mainHandler.postDelayed(preparationTimeout, PREPARATION_TIMEOUT_MS);
+        manager.setOtaStatusCallback(new OtaStatusCallback() {
             @Override
             public void onCanStartOtaChanged(boolean canStartOta) {
-                if (!canStartOta || otaStartRequested || otaManager.isOTA()) return;
+                if (otaManager != manager || !waitingForConnection || !canStartOta
+                        || otaStartRequested || manager.isOTA()) return;
 
+                clearPreparationTimeout();
+                waitingForConnection = false;
                 otaStartRequested = true;
-                Log.d(TAG, "OTA connection is ready, starting upgrade for: " + uuid);
-                startOtaWithFile(filePath);
+                Log.d(TAG, "SDK authentication and initialization ready, starting upgrade for: " + uuid);
+                try {
+                    startOtaWithFile(filePath);
+                } catch (RuntimeException error) {
+                    releaseOtaManager();
+                    invokeProgress(0, "ERROR: " + error.getMessage());
+                    return;
+                }
 
-                otaManager.queryMandatoryUpdate(new IActionCallback<TargetInfoResponse>() {
-                    @Override
-                    public void onSuccess(TargetInfoResponse deviceInfo) {
-                        Log.d(TAG, "queryMandatoryUpdate success");
-                    }
+            }
 
-                    @Override
-                    public void onError(BaseError baseError) {
-                        Log.e(TAG, "queryMandatoryUpdate error: " + baseError);
-                    }
-                });
+            @Override
+            public void onPreparationError(String reason) {
+                failPreparation(manager, reason);
             }
         });
+        if (waitingForConnection && !manager.startLeScan(SCAN_TIMEOUT_MS)) {
+            releaseOtaManager();
+            result.error("BLE_SCAN_FAILED", "BLE scanning could not be started", null);
+            return;
+        }
+        // This acknowledges preparation; STARTED reports the actual SDK upgrade.
         result.success(true);
     }
 
+    private void clearPreparationTimeout() {
+        if (preparationTimeout != null) {
+            mainHandler.removeCallbacks(preparationTimeout);
+            preparationTimeout = null;
+        }
+    }
+
+    private void failPreparation(OtaManager manager, String reason) {
+        if (otaManager != manager || !waitingForConnection) return;
+        Log.e(TAG, reason);
+        releaseOtaManager();
+        invokeProgress(0, "ERROR: " + reason);
+    }
+
+    private void releaseOtaManager() {
+        clearPreparationTimeout();
+        waitingForConnection = false;
+        otaStartRequested = false;
+        OtaManager manager = otaManager;
+        // Ignore callbacks from the old request while releasing its resources.
+        otaManager = null;
+        if (manager != null) {
+            manager.setOtaStatusCallback(null);
+            try {
+                manager.release();
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Failed to release OTA resources", error);
+            }
+        }
+    }
+
     private void startOtaWithFile(String filePath) {
+        final OtaManager manager = otaManager;
         Log.i(TAG, "Start to Set: " + filePath);
-        otaManager.getBluetoothOption().setFirmwareFilePath(filePath);
-        otaManager.startOTA(new IUpgradeCallback() {
+        manager.getBluetoothOption().setFirmwareFilePath(filePath);
+        manager.startOTA(new IUpgradeCallback() {
             @Override
             public void onStartOTA() {
+                if (otaManager != manager) return;
                 Log.d(TAG, "OTA started");
                 invokeProgress(0, "STARTED");
             }
 
             @Override
             public void onNeedReconnect(String addr, boolean isNewReconnectWay) {
-                if (otaManager.getBluetoothOption().isUseReconnect()) {
+                if (otaManager != manager) return;
+                if (manager.getBluetoothOption().isUseReconnect()) {
                     Log.d(TAG, "Reconnecting to: " + addr + ", new way: " + isNewReconnectWay);
-                    otaManager.reConnect(addr, isNewReconnectWay);
+                    manager.reConnect(addr, isNewReconnectWay);
                 }
             }
 
             @Override
             public void onProgress(int type, float progress) {
+                if (otaManager != manager) return;
                 int progressInt = (int) progress;
                 String status = type == 0 ? "DOWNLOADING_LOADER" : "UPGRADING_FIRMWARE";
                 Log.d(TAG, "OTA progress: " + progressInt + "%, type: " + type);
@@ -273,26 +360,25 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
             @Override
             public void onStopOTA() {
+                if (otaManager != manager) return;
                 Log.d(TAG, "OTA completed");
                 invokeProgress(100, "COMPLETED");
-                otaStartRequested = false;
-                otaManager.release();
+                releaseOtaManager();
             }
 
             @Override
             public void onCancelOTA() {
+                if (otaManager != manager) return;
                 Log.d(TAG, "OTA canceled");
-                if (otaManager.isOTA()) {
-                    otaManager.cancelOTA();
-                }
-                otaStartRequested = false;
+                releaseOtaManager();
                 invokeProgress(0, "CANCELED");
             }
 
             @Override
             public void onError(BaseError error) {
+                if (otaManager != manager) return;
                 Log.e(TAG, "OTA error: " + error.getMessage());
-                otaStartRequested = false;
+                releaseOtaManager();
                 invokeProgress(0, "ERROR: " + error.getMessage());
             }
         });
@@ -301,7 +387,8 @@ public class FlutterJlOtaPlugin implements FlutterPlugin, MethodCallHandler, Act
 
     // Sends progress updates through the MethodChannel.
     private void invokeProgress(int progress, String status) {
-        new Handler(Looper.getMainLooper()).post(() -> {
+        mainHandler.post(() -> {
+            if (channel == null) return;
             Map<String, Object> response = new HashMap<>();
             response.put("progress", progress);
             response.put("status", status);

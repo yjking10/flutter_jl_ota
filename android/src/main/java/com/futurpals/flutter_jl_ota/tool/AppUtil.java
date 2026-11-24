@@ -87,6 +87,13 @@ public class AppUtil {
         if (Build.VERSION.SDK_INT >= 31) {
             return isHasPermission(context, "android.permission.BLUETOOTH_SCAN");
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return isHasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return isHasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+                    || isHasLocationPermission(context);
+        }
         return true;
     }
 

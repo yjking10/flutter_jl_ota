@@ -124,6 +124,69 @@ void main() {
     expect(await FlutterJlOta.getSdkVersion(), 'V1.10.0(10932)');
   });
 
+  test('iOS OTA statuses reach listeners unchanged', () async {
+    final events = <String>[];
+    OtaService.listenToOtaProgress((progress, status) {
+      events.add('$progress:$status');
+    });
+
+    const statuses = [
+      'Preparing',
+      'Prepared',
+      'Upgrading',
+      'Reconnecting',
+      'ReconnectingWithMac',
+      'Success',
+    ];
+    for (final status in statuses) {
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+            channel.name,
+            channel.codec.encodeMethodCall(
+              MethodCall('otaProgress', {
+                'progress': status == 'Success' ? 100 : 0,
+                'status': status,
+              }),
+            ),
+            (_) {},
+          );
+    }
+
+    expect(events, [
+      '0:Preparing',
+      '0:Prepared',
+      '0:Upgrading',
+      '0:Reconnecting',
+      '0:ReconnectingWithMac',
+      '100:Success',
+    ]);
+  });
+
+  test('listener receives preparation errors before start returns', () async {
+    final events = <String>[];
+    FlutterJlOta.listenToOtaProgress((progress, status) => events.add(status));
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          await TestDefaultBinaryMessengerBinding
+              .instance
+              .defaultBinaryMessenger
+              .handlePlatformMessage(
+                channel.name,
+                channel.codec.encodeMethodCall(
+                  const MethodCall('otaProgress', {
+                    'progress': 0,
+                    'status': 'ERROR: BLE connection failed',
+                  }),
+                ),
+                (_) {},
+              );
+          return true;
+        });
+
+    expect(await FlutterJlOta.startOtaUpdate('device', '/tmp/ble.ufw'), isTrue);
+    expect(events, ['ERROR: BLE connection failed']);
+  });
+
   test('platform exceptions are converted to safe fallback values', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
@@ -131,6 +194,7 @@ void main() {
         });
 
     expect(await OtaService.stopScan(), isFalse);
+    expect(await OtaService.startOtaUpdate('device', '/tmp/ble.ufw'), isFalse);
     expect(await OtaService.isOtaUpdateInProgress(), isFalse);
     expect(await OtaService.getSdkVersion(), isNull);
   });

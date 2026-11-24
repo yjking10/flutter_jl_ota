@@ -4,6 +4,8 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothProfile;
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import com.futurpals.flutter_jl_ota.ble.BleManager;
@@ -11,13 +13,15 @@ import com.futurpals.flutter_jl_ota.ble.interfaces.BleEventCallback;
 import com.futurpals.flutter_jl_ota.ble.interfaces.OnWriteDataCallback;
 import com.jieli.jl_bt_ota.constant.StateCode;
 import com.jieli.jl_bt_ota.impl.BluetoothOTAManager;
+import com.jieli.jl_bt_ota.interfaces.BtEventCallback;
+import com.jieli.jl_bt_ota.model.base.BaseError;
 import com.jieli.jl_bt_ota.util.JL_Log;
 
+import java.util.Objects;
 import java.util.UUID;
 
 public class OtaManager extends BluetoothOTAManager {
     private static final String TAG = "OtaManager";
-    private static final long SCAN_TIMEOUT = 20 * 1000L; // 20-second scan timeout.
 
     private final Context context;
     private final BleManager bleManager;
@@ -25,6 +29,44 @@ public class OtaManager extends BluetoothOTAManager {
     public String deviceName;
     private OtaStatusCallback otaStatusCallback;
     private boolean canStartOta = false;
+    private boolean released = false;
+    private BluetoothDevice lastBleDevice;
+    private int lastBleStatus = -1;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final BtEventCallback sdkEventCallback = new BtEventCallback() {
+        @Override
+        public void onConnection(BluetoothDevice device, int status) {
+            // Let the SDK finish dispatching its initialization event before
+            // starting another SDK operation from our listener.
+            mainHandler.post(() -> {
+                if (released) return;
+                if (status != StateCode.CONNECTION_OK) {
+                    setCanStartOta(false);
+                    return;
+                }
+                if (lastBleStatus != StateCode.CONNECTION_OK
+                        || !Objects.equals(device, bleManager.getConnectedBtDevice())) return;
+                if (!checkDeviceIsCertify(device) || getDeviceInfo(device) == null) {
+                    Log.w(TAG, "SDK connection event arrived before authentication and device information were ready");
+                    return;
+                }
+                Log.d(TAG, "SDK ready: authentication complete, device information available");
+                setCanStartOta(true);
+            });
+        }
+
+        @Override
+        public void onError(BaseError error) {
+            mainHandler.post(() -> {
+                if (released) return;
+                setCanStartOta(false);
+                if (otaStatusCallback != null) {
+                    otaStatusCallback.onPreparationError("OTA SDK initialization failed ("
+                            + error.getCode() + "): " + error.getMessage());
+                }
+            });
+        }
+    };
 
     public OtaManager(Context context, String mac, String deviceName) {
         super(context);
@@ -37,20 +79,20 @@ public class OtaManager extends BluetoothOTAManager {
         this.bleManager = new BleManager(context, mac, this.deviceName);
         Log.d(TAG, "Initialized with mac: " + mac + ", deviceName: " + deviceName);
 
-        // Start scanning.
-        startLeScan(SCAN_TIMEOUT);
-
-        // Register BLE event callbacks.
+        // The plugin configures the SDK and registers its listener before scanning.
+        registerBluetoothCallback(sdkEventCallback);
         registerBleEventCallback();
     }
 
     // Starts BLE scanning.
-    public void startLeScan(long timeout) {
+    public boolean startLeScan(long timeout) {
         try {
-            bleManager.startLeScan(timeout);
-            Log.d(TAG, "Started BLE scan with timeout: " + timeout + "ms");
+            boolean started = bleManager.startLeScan(timeout);
+            Log.d(TAG, "BLE scan started: " + started + ", timeout: " + timeout + "ms");
+            return started;
         } catch (Exception e) {
             Log.e(TAG, "Failed to start BLE scan: " + e.getMessage(), e);
+            return false;
         }
     }
 
@@ -67,18 +109,46 @@ public class OtaManager extends BluetoothOTAManager {
     private void registerBleEventCallback() {
         bleManager.registerBleEventCallback(new BleEventCallback() {
             @Override
+            public void onAdapterChange(boolean enabled) {
+                if (!enabled && otaStatusCallback != null) {
+                    otaStatusCallback.onPreparationError("Bluetooth was disabled while preparing OTA");
+                }
+            }
+
+            @Override
+            public void onDiscoveryBleChange(boolean started) {
+                if (started) return;
+                // Connecting stops the scan before setting its connecting-device field.
+                mainHandler.post(() -> {
+                    if (otaStatusCallback != null && !canStartOta
+                            && !bleManager.isConnecting()
+                            && bleManager.getConnectedBtDevice() == null) {
+                        otaStatusCallback.onPreparationError(
+                                "BLE scan ended without connecting to the target device");
+                    }
+                });
+            }
+
+            @Override
             public void onBleConnection(BluetoothDevice device, int status) {
+                if (released || device == null) return;
                 int connectStatus = changeConnectStatus(status);
+                // Repeating CONNECTION_OK restarts the SDK authentication handshake.
+                if (Objects.equals(lastBleDevice, device) && lastBleStatus == connectStatus) return;
+                lastBleDevice = device;
+                lastBleStatus = connectStatus;
+                setCanStartOta(false);
                 JL_Log.d(TAG, "onBleConnection - device: " + device.getAddress() + ", status: " + connectStatus);
 
                 // Forward the device connection state to the OTA SDK.
                 onBtDeviceConnection(device, connectStatus);
 
-                // Update whether OTA can start.
-                if (connectStatus == StateCode.CONNECTION_OK) {
-                    setCanStartOta(true);
-                } else if (connectStatus == StateCode.CONNECTION_DISCONNECT) {
-                    setCanStartOta(false);
+                // BLE readiness starts authentication; only the SDK's onConnection
+                // callback above can allow an upgrade after initialization.
+                if (connectStatus == StateCode.CONNECTION_DISCONNECT) {
+                    if (otaStatusCallback != null) {
+                        otaStatusCallback.onPreparationError("BLE connection failed while preparing OTA");
+                    }
                 }
             }
 
@@ -193,6 +263,12 @@ public class OtaManager extends BluetoothOTAManager {
 
     @Override
     public void release() {
+        if (released) return;
+        released = true;
+        canStartOta = false;
+        otaStatusCallback = null;
+        unregisterBluetoothCallback(sdkEventCallback);
+        mainHandler.removeCallbacksAndMessages(null);
         super.release();
         try {
             bleManager.destroy();

@@ -115,6 +115,8 @@ public class BleManager {
 
 
     private volatile BluetoothDevice mConnectingBtDevice;     // Device being connected.
+    private volatile BluetoothGatt mConnectingGatt;
+    private volatile boolean destroyed;
     private volatile BluetoothDevice mUsingDevice;            // Device currently in use.
 
     private final Map<String, BleDevice> mConnectedGattMap = new HashMap<>();
@@ -257,10 +259,28 @@ public class BleManager {
     }
 
     public void destroy() {
+        if (destroyed) return;
+        destroyed = true;
         JL_Log.w(TAG, ">>>>>>>>>>>>>>destroy >>>>>>>>>>>>>>> ");
+        mReConnectHelper.release();
         unregisterReceiver();
 
         clearConnectedBleDevices();
+        // A pending connectGatt() has not entered mConnectedGattMap yet.
+        BluetoothGatt pendingGatt = mConnectingGatt;
+        mConnectingGatt = null;
+        setConnectingBtDevice(null);
+        if (pendingGatt != null && AppUtil.checkHasConnectPermission(mContext)) {
+            try {
+                try {
+                    pendingGatt.disconnect();
+                } finally {
+                    pendingGatt.close();
+                }
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Failed to close pending BLE connection", error);
+            }
+        }
 
         if (isBleScanning()) stopLeScan();
         isBleScanning(false);
@@ -303,12 +323,21 @@ public class BleManager {
 
     @SuppressLint("MissingPermission")
     public boolean startLeScan(long timeout) {
-        String TAG = "startLeScan";
-        Log.e(TAG, "null == mBluetoothAdapter");
-        if (null == mBluetoothAdapter || !AppUtil.checkHasScanPermission(mContext)) return false;
-        Log.e(TAG, "isBluetooth disEnable");
-
-        if (!isBluetoothEnable() || !AppUtil.isHasLocationPermission(mContext)) return false;
+        if (destroyed) return false;
+        if (mBluetoothAdapter == null) {
+            Log.e(TAG, "Cannot scan: Bluetooth adapter is unavailable");
+            return false;
+        }
+        // Android 12+ uses Nearby devices permissions with neverForLocation.
+        if (!AppUtil.checkHasScanPermission(mContext)
+                || !AppUtil.checkHasConnectPermission(mContext)) {
+            Log.e(TAG, "Cannot scan: required Bluetooth or legacy location permission is missing");
+            return false;
+        }
+        if (!isBluetoothEnable()) {
+            Log.e(TAG, "Cannot scan: Bluetooth is disabled");
+            return false;
+        }
         if (timeout <= 0) timeout = SCAN_BLE_TIMEOUT;
         if (isBleScanning) {
             JL_Log.i(TAG, "scanning ble .....");
@@ -482,6 +511,7 @@ public class BleManager {
 
     @SuppressLint("MissingPermission")
     public boolean connectBleDevice(BluetoothDevice device) {
+        if (destroyed) return false;
 //        if (isConnected) return true;
         // TODO: connect device.
         if (null == device || !AppUtil.checkHasConnectPermission(mContext)) return false;
@@ -523,6 +553,7 @@ public class BleManager {
 
         boolean ret = gatt != null;
         if (ret) {
+            mConnectingGatt = gatt;
 //            putConnectedGattInMap(device.getAddress(), gatt);
             setConnectingBtDevice(device);
 //            Log.e(TAG, "set mConnectingBtDevice == " + mConnectingBtDevice + ", device == " + device); // TODO: both values exist.
@@ -935,6 +966,10 @@ public class BleManager {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
             if (null == gatt || !AppUtil.checkHasConnectPermission(mContext)) return;
+            if (destroyed) {
+                gatt.close();
+                return;
+            }
             final BluetoothDevice device = gatt.getDevice();
             if (null == device) return;
             JL_Log.i(TAG, String.format(Locale.getDefault(), "onConnectionStateChange : device : %s, status = %d, newState = %d.",
@@ -942,6 +977,7 @@ public class BleManager {
             if (newState == BluetoothProfile.STATE_DISCONNECTED || newState == BluetoothProfile.STATE_DISCONNECTING
                     || newState == BluetoothProfile.STATE_CONNECTED) {
 
+                if (mConnectingGatt == gatt) mConnectingGatt = null;
                 setConnectingBtDevice(null);
                 if (newState == BluetoothProfile.STATE_CONNECTED) {  // BLE connected.
                     Log.e(TAG, "BLE connected.");
@@ -983,7 +1019,7 @@ public class BleManager {
         @SuppressLint("MissingPermission")
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            if (null == gatt || !AppUtil.checkHasConnectPermission(mContext)) return;
+            if (destroyed || null == gatt || !AppUtil.checkHasConnectPermission(mContext)) return;
             BluetoothDevice device = gatt.getDevice();
             if (null == device) return;
             mHandler.removeMessages(MSG_BLE_DISCOVER_SERVICES_CALLBACK_TIMEOUT);
